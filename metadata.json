@@ -1,0 +1,5 @@
+{
+  "name": "LingoNote",
+  "description": "A lightweight browser extension for highlighting and notes, designed for IELTS preparation.",
+  "requestFramePermissions": []
+}
