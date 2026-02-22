@@ -422,11 +422,10 @@ function deleteNote(id) {
   if (bubble) bubble.remove();
   if (card) card.remove();
 
-  // Remove Highlight Span
-  // We need to find the span in the main document (not shadow DOM)
-  // Since we added data-id to it in createNote
-  const span = document.querySelector(`.ln-highlight-span[data-id="${id}"]`);
-  if (span) {
+  // Remove Highlight Span(s)
+  // Use document.querySelectorAll to catch all fragments if the range was split
+  const spans = document.querySelectorAll(`.ln-highlight-span[data-id="${id}"]`);
+  spans.forEach(span => {
     const parent = span.parentNode;
     if (parent) {
       while (span.firstChild) {
@@ -435,7 +434,7 @@ function deleteNote(id) {
       parent.removeChild(span);
       parent.normalize();
     }
-  }
+  });
 }
 
 function repositionElements() {

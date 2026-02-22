@@ -27,7 +27,13 @@ class LingoNoteDemo {
 
   constructor(container: HTMLElement) {
     this.container = container;
+    
+    // Cleanup any existing demo hosts in this container to prevent duplicates
+    const existingHosts = this.container.querySelectorAll('.ln-demo-host');
+    existingHosts.forEach(h => h.remove());
+
     this.shadowHost = document.createElement('div');
+    this.shadowHost.className = 'ln-demo-host'; // Add class for identification
     this.shadowHost.style.position = 'absolute';
     this.shadowHost.style.top = '0';
     this.shadowHost.style.left = '0';
