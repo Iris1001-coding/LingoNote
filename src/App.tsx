@@ -50,7 +50,7 @@ class LingoNoteDemo {
   }
 
   async init() {
-    const styleRes = await fetch('/extension/styles.css');
+    const styleRes = await fetch('./extension/styles.css');
     const css = await styleRes.text();
     const style = document.createElement('style');
     style.textContent = css;

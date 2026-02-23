@@ -13,7 +13,7 @@ export const downloadExtension = async () => {
 
   try {
     for (const file of files) {
-      const response = await fetch(`/extension/${file}`);
+      const response = await fetch(`./extension/${file}`);
       const content = await response.text();
       folder?.file(file, content);
     }
