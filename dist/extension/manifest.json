@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "LingoNote",
+  "version": "1.0.0",
+  "description": "A lightweight highlighting and note-taking tool for IELTS preparation.",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["styles.css"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
