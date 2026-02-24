@@ -1,32 +1,17 @@
-import JSZip from 'jszip';
+// src/utils/zip.ts
 
 export const downloadExtension = async () => {
-  const zip = new JSZip();
-  const folder = zip.folder("lingonote-extension");
+  // 这是你 GitHub Release 文件的真实直连下载地址
+  const downloadUrl = 'https://github.com/Iris1001-coding/LingoNote/releases/download/v1.0.1/LingoNote_v1.0.1.zip';
 
-  const files = [
-    'manifest.json',
-    'content.js',
-    'styles.css',
-    'popup.html'
-  ];
+  // 模拟点击下载逻辑
+  const a = document.createElement('a');
+  a.href = downloadUrl;
+  // 浏览器下载时显示的文件名
+  a.download = "LingoNote_extension_v1.0.1.zip"; 
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 
-  try {
-    for (const file of files) {
-      const response = await fetch(`./extension/${file}`);
-      const content = await response.text();
-      folder?.file(file, content);
-    }
-
-    const content = await zip.generateAsync({ type: "blob" });
-    const url = window.URL.createObjectURL(content);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = "lingonote-extension.zip";
-    a.click();
-    window.URL.revokeObjectURL(url);
-  } catch (error) {
-    console.error("Failed to zip extension:", error);
-    alert("Failed to download extension files. Please try again.");
-  }
+  console.log("Downloading the latest stable version from GitHub Releases...");
 };
