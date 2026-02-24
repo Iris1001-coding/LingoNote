@@ -13,6 +13,12 @@ const COLORS = {
   orange: { hex: '#FFAB40', label: 'Vocab', hl: 'rgba(255, 171, 64, 0.2)' }
 };
 
+const STORAGE_KEY = 'lingonotes';
+const UI_CONFIG_KEY = 'lingonote_ui_config';
+const DEFAULT_COLOR_LABELS = Object.fromEntries(
+  Object.entries(COLORS).map(([key, val]) => [key, val.label])
+);
+
 // --- State ---
 let shadowHost = null;
 let shadowRoot = null;
@@ -21,46 +27,142 @@ let notes = [];
 let toolbar = null;
 let legend = null;
 let isLegendCollapsed = false;
-let legendTitle = "LingoNote";
+let legendTitle = 'LingoNote';
+let isExtensionEnabled = true;
+let messageListenerRegistered = false;
+
+function normalizeUrl(url = window.location.href) {
+  try {
+    const parsed = new URL(url || window.location.href, window.location.href);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch (error) {
+    return (url || window.location.href).split('#')[0].split('?')[0];
+  }
+}
+
+function getCurrentPageKey() {
+  return normalizeUrl(window.location.href);
+}
+
+function sanitizeLabelText(value) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function applyLabelChangesToUI() {
+  if (toolbar) {
+    toolbar.querySelectorAll('.ln-color-btn').forEach((btn) => {
+      const color = btn.dataset.color;
+      if (color && COLORS[color]) {
+        btn.setAttribute('title', COLORS[color].label);
+      }
+    });
+  }
+
+  if (legend) {
+    const titleEl = legend.querySelector('.ln-legend-title');
+    if (titleEl) titleEl.innerText = legendTitle;
+  }
+
+  if (!shadowRoot) return;
+
+  shadowRoot.querySelectorAll('.ln-note-card').forEach((card) => {
+    const color = card.dataset.color;
+    const labelEl = card.querySelector('.ln-note-type-label');
+    if (color && labelEl && COLORS[color]) {
+      labelEl.innerText = COLORS[color].label;
+    }
+  });
+
+  shadowRoot.querySelectorAll('.ln-bubble').forEach((bubble) => {
+    const noteId = bubble.dataset.id;
+    const previewEl = bubble.querySelector('.ln-bubble-preview');
+    if (!noteId || !previewEl) return;
+    const note = notes.find((item) => item.id === noteId);
+    if (note && !note.text && COLORS[note.color]) {
+      previewEl.innerText = COLORS[note.color].label;
+    }
+  });
+}
+
+function saveUiConfig() {
+  const colorLabels = {};
+  Object.keys(COLORS).forEach((key) => {
+    colorLabels[key] = COLORS[key].label;
+  });
+
+  chrome.storage.local.set({
+    [UI_CONFIG_KEY]: {
+      legendTitle,
+      colorLabels,
+    },
+  });
+}
+
+function loadUiConfig() {
+  chrome.storage.local.get([UI_CONFIG_KEY], (result) => {
+    const config = result[UI_CONFIG_KEY];
+    if (!config || typeof config !== 'object') return;
+
+    const nextTitle = sanitizeLabelText(config.legendTitle);
+    if (nextTitle) legendTitle = nextTitle;
+
+    const savedLabels = config.colorLabels;
+    if (savedLabels && typeof savedLabels === 'object') {
+      Object.keys(COLORS).forEach((key) => {
+        const custom = sanitizeLabelText(savedLabels[key]);
+        COLORS[key].label = custom || DEFAULT_COLOR_LABELS[key];
+      });
+    }
+
+    applyLabelChangesToUI();
+    updateLegend();
+    applyLabelChangesToUI();
+  });
+}
 
 // --- Initialization ---
 function init() {
-  // Prevent running on the demo page to avoid duplicate UI
-  if (document.body.classList.contains('ln-demo-page')) {
-    console.log('LingoNote: Demo page detected, extension disabled.');
-    return;
-  }
-
-  // Watch for class changes (in case React adds it late)
-  const observer = new MutationObserver((mutations) => {
-    mutations.forEach((mutation) => {
-      if (mutation.attributeName === 'class' && document.body.classList.contains('ln-demo-page')) {
-        console.log('LingoNote: Demo page detected late, removing UI.');
-        if (shadowHost) shadowHost.remove();
-        observer.disconnect();
-      }
-    });
-  });
-  observer.observe(document.body, { attributes: true });
+  if (document.body.classList.contains('ln-demo-page')) return;
 
   setupShadowDOM();
+  loadUiConfig();
   setupSelectionListener();
-  loadNotes();
-  
-  // Handle window resize/scroll to update positions
+  setupMessageListener();
+
+  // Delay loading to improve match rate on pages that render text late.
+  setTimeout(loadNotes, 500);
+
   window.addEventListener('resize', debounce(repositionElements, 100));
+
+  document.addEventListener('mousedown', (e) => {
+    if (!isExtensionEnabled) return;
+    if (shadowHost && !shadowHost.contains(e.target)) {
+      hideAllCards();
+    }
+  });
+
+  // Best-effort flush so note text is not lost when leaving page quickly.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      syncTextFromCards();
+      saveNotes();
+    }
+  });
+
+  window.addEventListener('beforeunload', () => {
+    syncTextFromCards();
+    saveNotes();
+  });
 }
 
 function setupShadowDOM() {
-  // Create the shadow host
   shadowHost = document.createElement('div');
   shadowHost.id = 'lingonote-host';
   document.body.appendChild(shadowHost);
 
-  // Attach shadow DOM
   shadowRoot = shadowHost.attachShadow({ mode: 'open' });
 
-  // Inject styles
   const styleLink = document.createElement('link');
   styleLink.rel = 'stylesheet';
   styleLink.href = chrome.runtime.getURL('styles.css');
@@ -71,25 +173,24 @@ function setupShadowDOM() {
 }
 
 function createToolbar() {
-  if (toolbar) return; // Prevent duplicates
+  if (toolbar) return;
 
   toolbar = document.createElement('div');
   toolbar.className = 'ln-toolbar';
-  
+
   let buttonsHtml = '';
   Object.entries(COLORS).forEach(([key, val]) => {
     buttonsHtml += `<div class="ln-color-btn ln-c-${key}" data-color="${key}" title="${val.label}"></div>`;
   });
-  
+
   toolbar.innerHTML = buttonsHtml;
   shadowRoot.appendChild(toolbar);
 
-  toolbar.querySelectorAll('.ln-color-btn').forEach(btn => {
+  toolbar.querySelectorAll('.ln-color-btn').forEach((btn) => {
     btn.addEventListener('mousedown', (e) => {
-      e.preventDefault(); // Prevent losing selection
+      e.preventDefault();
       e.stopPropagation();
-      const color = btn.dataset.color;
-      createNote(color);
+      createNote(btn.dataset.color);
     });
   });
 }
@@ -105,122 +206,118 @@ function createLegend() {
       </div>
     </div>
     <div class="ln-legend-list"></div>
-    <div class="ln-legend-icon">
+    <div class="ln-legend-icon" title="Open">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>
     </div>
   `;
+
   shadowRoot.appendChild(legend);
   updateLegend();
   makeDraggable(legend);
 
-  // Toggle Collapse
   const toggleBtn = legend.querySelector('.ln-legend-toggle');
-  const icon = legend.querySelector('.ln-legend-icon');
-  
-  const toggle = (e) => {
+  const iconBtn = legend.querySelector('.ln-legend-icon');
+  const titleEl = legend.querySelector('.ln-legend-title');
+  const toggleLegend = (e) => {
     e.stopPropagation();
     isLegendCollapsed = !isLegendCollapsed;
-    if (isLegendCollapsed) {
-      legend.classList.add('collapsed');
-    } else {
-      legend.classList.remove('collapsed');
-    }
+    isLegendCollapsed ? legend.classList.add('collapsed') : legend.classList.remove('collapsed');
   };
 
-  toggleBtn.addEventListener('click', toggle);
-  icon.addEventListener('click', toggle);
+  toggleBtn.addEventListener('click', toggleLegend);
+  iconBtn.addEventListener('click', toggleLegend);
 
-  // Title Edit
-  const titleEl = legend.querySelector('.ln-legend-title');
-  titleEl.addEventListener('blur', (e) => {
-    legendTitle = e.target.innerText;
-    // In real app, save to storage
+  titleEl.addEventListener('blur', () => {
+    const nextTitle = sanitizeLabelText(titleEl.innerText);
+    legendTitle = nextTitle || 'LingoNote';
+    titleEl.innerText = legendTitle;
+    saveUiConfig();
+  });
+  titleEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      titleEl.blur();
+    }
   });
 }
 
 function updateLegend() {
   if (!legend) return;
-  const list = legend.querySelector('.ln-legend-list');
-  if (!list) return;
 
+  const list = legend.querySelector('.ln-legend-list');
   let html = '';
+
   Object.entries(COLORS).forEach(([key, val]) => {
     html += `
       <div class="ln-legend-item">
         <div class="ln-legend-dot ln-c-${key}"></div>
-        <div class="ln-legend-label" contenteditable="true" data-key="${key}">${val.label}</div>
-      </div>
-    `;
+        <div class="ln-legend-label" contenteditable="true" data-color="${key}">${val.label}</div>
+      </div>`;
   });
-  list.innerHTML = html;
 
-  // Allow editing labels
-  list.querySelectorAll('.ln-legend-label').forEach(el => {
-    el.addEventListener('blur', (e) => {
-      const key = e.target.dataset.key;
-      if (key && COLORS[key]) {
-        COLORS[key].label = e.target.innerText;
-        // Update existing tooltips
-        const btn = toolbar?.querySelector(`.ln-color-btn[data-color="${key}"]`);
-        if (btn) btn.setAttribute('title', COLORS[key].label);
-        // Save config (in real app, save to storage)
+  list.innerHTML = html;
+  list.querySelectorAll('.ln-legend-label').forEach((labelEl) => {
+    labelEl.addEventListener('blur', () => {
+      const color = labelEl.dataset.color;
+      if (!color || !COLORS[color]) return;
+      const custom = sanitizeLabelText(labelEl.innerText);
+      COLORS[color].label = custom || DEFAULT_COLOR_LABELS[color];
+      labelEl.innerText = COLORS[color].label;
+      applyLabelChangesToUI();
+      saveUiConfig();
+    });
+    labelEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        labelEl.blur();
       }
     });
   });
 }
 
 function makeDraggable(element) {
-  let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+  let pos1 = 0;
+  let pos2 = 0;
+  let pos3 = 0;
+  let pos4 = 0;
+
   const header = element.querySelector('.ln-legend-header');
   const icon = element.querySelector('.ln-legend-icon');
-
-  const dragMouseDown = (e) => {
-    e = e || window.event;
-    // Only drag if not editing text
+  const startDrag = (e) => {
     if (e.target.isContentEditable) return;
 
     e.preventDefault();
     pos3 = e.clientX;
     pos4 = e.clientY;
-    document.onmouseup = closeDragElement;
-    document.onmousemove = elementDrag;
+
+    document.onmouseup = () => {
+      document.onmouseup = null;
+      document.onmousemove = null;
+    };
+
+    document.onmousemove = (event) => {
+      event.preventDefault();
+      pos1 = pos3 - event.clientX;
+      pos2 = pos4 - event.clientY;
+      pos3 = event.clientX;
+      pos4 = event.clientY;
+      element.style.top = `${element.offsetTop - pos2}px`;
+      element.style.left = `${element.offsetLeft - pos1}px`;
+    };
   };
 
-  if (header) header.onmousedown = dragMouseDown;
-  if (icon) icon.onmousedown = dragMouseDown;
-
-  function elementDrag(e) {
-    e = e || window.event;
-    e.preventDefault();
-    pos1 = pos3 - e.clientX;
-    pos2 = pos4 - e.clientY;
-    pos3 = e.clientX;
-    pos4 = e.clientY;
-    element.style.top = (element.offsetTop - pos2) + "px";
-    element.style.left = (element.offsetLeft - pos1) + "px";
-    element.style.right = 'auto';
-    element.style.bottom = 'auto';
-  }
-
-  function closeDragElement() {
-    document.onmouseup = null;
-    document.onmousemove = null;
-  }
+  if (header) header.onmousedown = startDrag;
+  if (icon) icon.onmousedown = startDrag;
 }
 
 // --- Selection Handling ---
 function setupSelectionListener() {
   document.addEventListener('mouseup', (e) => {
-    // Ignore events inside the demo container to prevent double toolbars
-    if (e.target.closest('.ln-demo-container')) {
-      return;
-    }
+    if (!isExtensionEnabled) return;
+    if (e.target.closest('.ln-demo-container')) return;
 
-    // Wait a tick to let selection settle
     setTimeout(() => {
       const selection = window.getSelection();
-      
-      // Ignore if selection is empty or inside our shadow DOM
       if (selection.isCollapsed || shadowHost.contains(e.target)) {
         hideToolbar();
         return;
@@ -239,11 +336,8 @@ function setupSelectionListener() {
 
 function showToolbar(range) {
   const rect = range.getBoundingClientRect();
-  
-  // Calculate position relative to viewport + scroll
-  const top = rect.top + window.scrollY;
-  const left = rect.left + (rect.width / 2) + window.scrollX;
-
+  const top = rect.top + window.scrollY - 40;
+  const left = rect.left + (rect.width / 2) + window.scrollX - 80;
   toolbar.style.top = `${top}px`;
   toolbar.style.left = `${left}px`;
   toolbar.classList.add('visible');
@@ -254,207 +348,437 @@ function hideToolbar() {
   activeSelection = null;
 }
 
-// --- Note Creation ---
-function createNote(color) {
-  if (!activeSelection) return;
-
-  const range = activeSelection;
-  const text = range.toString();
-  
-  // Create unique ID
-  const id = Date.now().toString(36) + Math.random().toString(36).substr(2);
-
-  // 1. Capture coordinates BEFORE modifying DOM
-  const rect = range.getBoundingClientRect();
-  
-  // Check validity
-  if (rect.width === 0 && rect.height === 0) {
-      console.warn("Invalid selection rect");
-      return;
-  }
-
-  const scrollTop = rect.top + window.scrollY;
-  const scrollLeft = rect.left + window.scrollX;
-
-  // 2. Try to highlight (Robust)
+// --- Note Creation & DOM Injection ---
+function applyHighlightToRange(range, id, color) {
   const span = document.createElement('span');
   span.style.backgroundColor = COLORS[color].hl;
   span.style.borderBottom = `2px solid ${COLORS[color].hex}`;
   span.style.cursor = 'pointer';
   span.className = 'ln-highlight-span';
   span.dataset.id = id;
-  
+
   try {
     range.surroundContents(span);
-  } catch (e) {
-    // Fallback: Extract and wrap
+  } catch (error) {
     const fragment = range.extractContents();
     span.appendChild(fragment);
     range.insertNode(span);
   }
+}
 
-  // 3. Overlap / Stacking Logic
-  const nearbyNotes = notes.filter(n => 
-    Math.abs(n.anchor.scrollTop - scrollTop) < 15 && 
-    Math.abs(n.anchor.scrollLeft - scrollLeft) < 50
-  );
-  
-  let finalTop = scrollTop;
-  let finalLeft = scrollLeft;
-
-  if (nearbyNotes.length > 0) {
-      // Stack upwards
-      finalTop = scrollTop - (15 * nearbyNotes.length);
+function getRangeAnchorRect(range) {
+  const rects = range.getClientRects();
+  for (let i = 0; i < rects.length; i += 1) {
+    const rect = rects[i];
+    if (rect.width > 0 && rect.height > 0) return rect;
   }
+  return range.getBoundingClientRect();
+}
+
+function getHighlightAnchorRectById(id) {
+  const spans = document.querySelectorAll(`.ln-highlight-span[data-id="${id}"]`);
+  for (let i = 0; i < spans.length; i += 1) {
+    const rect = spans[i].getBoundingClientRect();
+    if (rect.width > 0 || rect.height > 0) return rect;
+  }
+  return null;
+}
+
+function updateNoteAnchorFromHighlight(note) {
+  if (!note?.id || !note?.anchor) return false;
+  const rect = getHighlightAnchorRectById(note.id);
+  if (!rect) return false;
+
+  note.anchor.scrollTop = rect.top + window.scrollY;
+  note.anchor.scrollLeft = rect.left + (rect.width / 2) + window.scrollX;
+  return true;
+}
+
+function positionNoteUI(note) {
+  const bubble = shadowRoot?.querySelector(`.ln-bubble[data-id="${note.id}"]`);
+  const card = shadowRoot?.querySelector(`.ln-note-card[data-id="${note.id}"]`);
+  if (!bubble || !card) return;
+
+  bubble.style.top = `${note.anchor.scrollTop - 10}px`;
+  bubble.style.left = `${note.anchor.scrollLeft - 10}px`;
+  card.style.top = `${note.anchor.scrollTop + 20}px`;
+  card.style.left = `${note.anchor.scrollLeft}px`;
+}
+
+function createNote(color) {
+  if (!isExtensionEnabled) return;
+  if (!activeSelection) return;
+
+  const range = activeSelection;
+  const text = range.toString().trim();
+  const id = Date.now().toString(36) + Math.random().toString(36).substr(2);
+
+  const rect = getRangeAnchorRect(range);
+  if (rect.width === 0 && rect.height === 0) return;
+
+  const scrollTop = rect.top + window.scrollY;
+  const scrollLeft = rect.left + (rect.width / 2) + window.scrollX;
+
+  applyHighlightToRange(range, id, color);
 
   const anchor = {
-    text: text,
-    scrollTop: finalTop,
-    scrollLeft: finalLeft
+    text,
+    scrollTop,
+    scrollLeft,
+    url: getCurrentPageKey(),
   };
 
-  const note = {
-    id,
-    color,
-    text: '',
-    anchor,
-    createdAt: Date.now()
-  };
+  const note = { id, color, text: '', anchor, createdAt: Date.now() };
+
+  // Prefer exact highlight geometry over raw selection bounds.
+  updateNoteAnchorFromHighlight(note);
 
   notes.push(note);
   saveNotes();
-  renderNote(note);
-  
-  // Clear selection and toolbar
+  renderNote(note, true);
+
   window.getSelection().removeAllRanges();
   hideToolbar();
 }
 
 // --- Rendering ---
-function renderNote(note) {
-  // 1. Create Bubble
+function renderNote(note, autoShow = false) {
+  const noteUrl = note?.anchor?.url;
+  if (noteUrl && normalizeUrl(noteUrl) !== getCurrentPageKey()) return;
+
+  updateNoteAnchorFromHighlight(note);
+
   const bubble = document.createElement('div');
   bubble.className = `ln-bubble ln-c-${note.color}`;
   bubble.dataset.id = note.id;
-  bubble.style.top = `${note.anchor.scrollTop}px`;
-  bubble.style.left = `${note.anchor.scrollLeft}px`;
+  bubble.style.top = `${note.anchor.scrollTop - 10}px`;
+  bubble.style.left = `${note.anchor.scrollLeft - 10}px`;
 
-  // Preview Tooltip
   const preview = document.createElement('div');
   preview.className = 'ln-bubble-preview';
-  preview.innerText = COLORS[note.color].label;
+  preview.innerText = note.text ? note.text : COLORS[note.color].label;
   bubble.appendChild(preview);
 
-  // 2. Create Note Card (Hidden by default)
   const card = document.createElement('div');
   card.className = 'ln-note-card';
   card.dataset.id = note.id;
+  card.dataset.color = note.color;
+
+  const savedText = note.text || '';
   card.innerHTML = `
     <div class="ln-note-header">
       <div class="ln-note-type">
         <div class="ln-note-dot ln-bubble ln-c-${note.color}" style="position:static; transform:none;"></div>
-        <span>${COLORS[note.color].label}</span>
+        <span class="ln-note-type-label">${COLORS[note.color].label}</span>
       </div>
       <div class="ln-actions">
         <button class="ln-icon-btn minimize" title="Minimize">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 14 10 14 10 20"></polyline><polyline points="20 10 14 10 14 4"></polyline></svg>
         </button>
         <button class="ln-icon-btn delete" title="Delete">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
         </button>
       </div>
     </div>
-    <textarea class="ln-note-content" placeholder="Add a note...">${note.text}</textarea>
+    <textarea class="ln-note-content" placeholder="Add a note...">${savedText}</textarea>
     <div class="ln-highlight-text">"${note.anchor.text}"</div>
   `;
 
   card.style.top = `${note.anchor.scrollTop + 20}px`;
   card.style.left = `${note.anchor.scrollLeft}px`;
 
-  // Events
   bubble.addEventListener('click', (e) => {
     e.stopPropagation();
     toggleCard(card);
   });
 
   card.addEventListener('click', (e) => e.stopPropagation());
-  
-  // Minimize
+
   card.querySelector('.minimize').addEventListener('click', (e) => {
     e.stopPropagation();
     card.classList.remove('visible');
   });
 
-  // Auto-save on input
   const textarea = card.querySelector('textarea');
   textarea.addEventListener('input', debounce((e) => {
     note.text = e.target.value;
     preview.innerText = note.text || COLORS[note.color].label;
     saveNotes();
-  }, 500));
+  }, 200));
+  textarea.addEventListener('blur', (e) => {
+    note.text = e.target.value;
+    preview.innerText = note.text || COLORS[note.color].label;
+    saveNotes();
+  });
 
-  // Delete
   card.querySelector('.delete').addEventListener('click', () => {
     deleteNote(note.id);
   });
 
   shadowRoot.appendChild(bubble);
   shadowRoot.appendChild(card);
-  
-  setTimeout(() => card.classList.add('visible'), 10);
+
+  if (autoShow) {
+    setTimeout(() => {
+      hideAllCards();
+      card.classList.add('visible');
+    }, 10);
+  }
+
+  positionNoteUI(note);
 }
 
 function toggleCard(card) {
-  // Close others
-  shadowRoot.querySelectorAll('.ln-note-card.visible').forEach(c => {
-    if (c !== card) c.classList.remove('visible');
-  });
-  card.classList.toggle('visible');
+  const isCurrentlyVisible = card.classList.contains('visible');
+  hideAllCards();
+  if (!isCurrentlyVisible) {
+    card.classList.add('visible');
+  }
 }
 
-function deleteNote(id) {
-  notes = notes.filter(n => n.id !== id);
-  saveNotes();
-  
-  // Remove UI
-  const bubble = shadowRoot.querySelector(`.ln-bubble[data-id="${id}"]`);
-  const card = shadowRoot.querySelector(`.ln-note-card[data-id="${id}"]`);
-  if (bubble) bubble.remove();
-  if (card) card.remove();
+function hideAllCards() {
+  if (!shadowRoot) return;
 
-  // Remove Highlight Span(s)
-  // Use document.querySelectorAll to catch all fragments if the range was split
+  shadowRoot.querySelectorAll('.ln-note-card.visible').forEach((c) => {
+    c.classList.remove('visible');
+  });
+}
+
+function removeHighlightById(id) {
   const spans = document.querySelectorAll(`.ln-highlight-span[data-id="${id}"]`);
-  spans.forEach(span => {
+  spans.forEach((span) => {
     const parent = span.parentNode;
-    if (parent) {
-      while (span.firstChild) {
-        parent.insertBefore(span.firstChild, span);
-      }
-      parent.removeChild(span);
-      parent.normalize();
+    if (!parent) return;
+
+    while (span.firstChild) {
+      parent.insertBefore(span.firstChild, span);
+    }
+
+    parent.removeChild(span);
+    parent.normalize();
+  });
+}
+
+function setHighlightVisibleById(id, color, visible) {
+  const spans = document.querySelectorAll(`.ln-highlight-span[data-id="${id}"]`);
+  spans.forEach((span) => {
+    if (visible) {
+      span.style.backgroundColor = COLORS[color].hl;
+      span.style.borderBottom = `2px solid ${COLORS[color].hex}`;
+      span.style.cursor = 'pointer';
+      span.style.pointerEvents = '';
+    } else {
+      span.style.backgroundColor = 'transparent';
+      span.style.borderBottom = 'none';
+      span.style.cursor = 'default';
+      span.style.pointerEvents = 'none';
     }
   });
 }
 
-function repositionElements() {
-  // In a real app, this would re-scan the DOM for the text anchors 
-  // and update the top/left of bubbles and cards.
-  // For this demo, we assume static content or simple resize.
+function setHighlightsVisible(visible) {
+  notes.forEach((note) => {
+    if (!note?.id || !note?.color) return;
+    setHighlightVisibleById(note.id, note.color, visible);
+  });
+}
+
+function syncTextFromCards() {
+  if (!shadowRoot) return;
+  const textareas = shadowRoot.querySelectorAll('.ln-note-card textarea');
+  textareas.forEach((textarea) => {
+    const card = textarea.closest('.ln-note-card');
+    const noteId = card?.dataset?.id;
+    if (!noteId) return;
+    const note = notes.find((item) => item.id === noteId);
+    if (note) note.text = textarea.value;
+  });
+}
+
+function deleteNote(id) {
+  notes = notes.filter((n) => n.id !== id);
+  saveNotes();
+
+  const bubble = shadowRoot.querySelector(`.ln-bubble[data-id="${id}"]`);
+  const card = shadowRoot.querySelector(`.ln-note-card[data-id="${id}"]`);
+
+  if (bubble) bubble.remove();
+  if (card) card.remove();
+
+  removeHighlightById(id);
 }
 
 // --- Storage ---
 function loadNotes() {
-  chrome.storage.sync.get(['lingonotes'], (result) => {
-    if (result.lingonotes) {
-      notes = result.lingonotes;
-      notes.forEach(renderNote);
+  const currentPageKey = getCurrentPageKey();
+  console.log('LingoNote Debug: loading notes for', currentPageKey);
+
+  chrome.storage.local.get([STORAGE_KEY], (result) => {
+    const storedNotes = Array.isArray(result[STORAGE_KEY]) ? result[STORAGE_KEY] : [];
+
+    notes = storedNotes
+      .filter((note) => {
+        const noteUrl = note?.anchor?.url;
+        if (!noteUrl) return true;
+        return normalizeUrl(noteUrl) === currentPageKey;
+      })
+      .map((note) => ({
+        ...note,
+        anchor: {
+          ...(note.anchor || {}),
+          url: currentPageKey,
+        },
+      }));
+
+    if (!notes.length) {
+      console.log('LingoNote Debug: no notes for current page');
+      return;
     }
+
+    notes.forEach((note) => {
+      reconstructHighlight(note);
+      updateNoteAnchorFromHighlight(note);
+      renderNote(note, false);
+    });
+
+    if (!isExtensionEnabled) {
+      setHighlightsVisible(false);
+    }
+
+    // Reposition once after delayed page layout settles.
+    setTimeout(() => {
+      repositionElements();
+      saveNotes();
+    }, 1200);
+  });
+}
+
+function reconstructHighlight(note) {
+  const targetText = note?.anchor?.text;
+  if (!targetText) return;
+
+  if (document.querySelector(`.ln-highlight-span[data-id="${note.id}"]`)) {
+    updateNoteAnchorFromHighlight(note);
+    return;
+  }
+
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+  let node;
+  let bestMatch = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  const targetTop = Number(note?.anchor?.scrollTop) || 0;
+  const targetLeft = Number(note?.anchor?.scrollLeft) || 0;
+
+  while ((node = walker.nextNode())) {
+    const textContent = node.nodeValue;
+    if (!textContent) continue;
+    if (['SCRIPT', 'STYLE'].includes(node.parentNode.nodeName)) continue;
+    if (node.parentNode.className === 'ln-highlight-span') continue;
+
+    let fromIndex = 0;
+    while (fromIndex < textContent.length) {
+      const index = textContent.indexOf(targetText, fromIndex);
+      if (index === -1) break;
+
+      const range = document.createRange();
+      range.setStart(node, index);
+      range.setEnd(node, index + targetText.length);
+      const rect = getRangeAnchorRect(range);
+      const top = rect.top + window.scrollY;
+      const left = rect.left + (rect.width / 2) + window.scrollX;
+      const distance = Math.hypot(top - targetTop, left - targetLeft);
+
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestMatch = range;
+      }
+
+      fromIndex = index + targetText.length;
+    }
+  }
+
+  if (bestMatch) {
+    applyHighlightToRange(bestMatch, note.id, note.color);
+    updateNoteAnchorFromHighlight(note);
+    if (!isExtensionEnabled) {
+      setHighlightVisibleById(note.id, note.color, false);
+    }
+  }
+}
+
+function repositionElements() {
+  notes.forEach((note) => {
+    const updated = updateNoteAnchorFromHighlight(note);
+    if (updated) positionNoteUI(note);
   });
 }
 
 function saveNotes() {
-  chrome.storage.sync.set({ lingonotes: notes });
+  syncTextFromCards();
+
+  const currentPageKey = getCurrentPageKey();
+  const currentPageNotes = notes.map((note) => ({
+    ...note,
+    anchor: {
+      ...(note.anchor || {}),
+      url: currentPageKey,
+    },
+  }));
+
+  chrome.storage.local.get([STORAGE_KEY], (result) => {
+    const storedNotes = Array.isArray(result[STORAGE_KEY]) ? result[STORAGE_KEY] : [];
+    const currentIds = new Set(currentPageNotes.map((note) => note.id));
+
+    const otherPageNotes = storedNotes.filter((note) => {
+      const noteUrl = note?.anchor?.url;
+      if (!noteUrl) return !currentIds.has(note.id);
+      return normalizeUrl(noteUrl) !== currentPageKey;
+    });
+
+    const mergedNotes = [...otherPageNotes, ...currentPageNotes];
+
+    chrome.storage.local.set({ [STORAGE_KEY]: mergedNotes }, () => {
+      if (chrome.runtime.lastError) {
+        console.error('LingoNote Debug: save failed ->', chrome.runtime.lastError);
+      }
+    });
+  });
+}
+
+// --- Extension Toggle ---
+function setExtensionEnabled(enabled) {
+  isExtensionEnabled = enabled;
+
+  if (shadowHost) {
+    shadowHost.style.display = enabled ? '' : 'none';
+  }
+
+  setHighlightsVisible(enabled);
+
+  if (!enabled) {
+    hideToolbar();
+    hideAllCards();
+  }
+}
+
+function setupMessageListener() {
+  if (messageListenerRegistered) return;
+  messageListenerRegistered = true;
+
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (!message || !message.type) return;
+
+    if (message.type === 'LINGONOTE_TOGGLE') {
+      setExtensionEnabled(!isExtensionEnabled);
+      sendResponse({ enabled: isExtensionEnabled });
+      return true;
+    }
+
+    if (message.type === 'LINGONOTE_GET_STATE') {
+      sendResponse({ enabled: isExtensionEnabled });
+      return true;
+    }
+  });
 }
 
 // --- Utils ---
@@ -466,7 +790,6 @@ function debounce(func, wait) {
   };
 }
 
-// Run
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', init);
 } else {
