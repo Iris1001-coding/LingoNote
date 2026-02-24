@@ -8,10 +8,11 @@ export const downloadExtension = async () => {
   const a = document.createElement('a');
   a.href = downloadUrl;
   // 浏览器下载时显示的文件名
-  a.download = "LingoNote_extension_v1.0.1.zip"; 
+  a.download = "LingoNote_v1.0.1.zip"; 
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
 
   console.log("Downloading the latest stable version from GitHub Releases...");
 };
+
