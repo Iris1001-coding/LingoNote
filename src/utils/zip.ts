@@ -3,6 +3,7 @@ import JSZip from 'jszip';
 export const downloadExtension = async () => {
   const zip = new JSZip();
   const folder = zip.folder('lingonote-extension');
+  const extensionBase = `${import.meta.env.BASE_URL}extension/`;
 
   const files = [
     {name: 'manifest.json', binary: false},
@@ -17,7 +18,7 @@ export const downloadExtension = async () => {
     let manifestVersion = '1.0.0';
 
     for (const file of files) {
-      const response = await fetch(`./extension/${file.name}`);
+      const response = await fetch(`${extensionBase}${file.name}`);
       if (!response.ok) {
         throw new Error(`Failed to fetch ${file.name}: ${response.status}`);
       }
@@ -49,8 +50,13 @@ export const downloadExtension = async () => {
     const a = document.createElement('a');
     a.href = url;
     a.download = `LingNote_v${safeVersion}.zip`;
+    a.style.display = 'none';
+    document.body.appendChild(a);
     a.click();
-    window.URL.revokeObjectURL(url);
+    a.remove();
+    window.setTimeout(() => {
+      window.URL.revokeObjectURL(url);
+    }, 1000);
   } catch (error) {
     console.error('Failed to zip extension:', error);
     alert('Failed to download extension files. Please try again.');
