@@ -30,6 +30,11 @@ let isLegendCollapsed = false;
 let legendTitle = 'LingoNote';
 let isExtensionEnabled = true;
 let messageListenerRegistered = false;
+const watchedScrollContainers = new WeakSet();
+let repositionRaf = 0;
+let anchorRecoveryObserver = null;
+let anchorRecoveryInterval = null;
+let anchorRecoveryStopTimeout = null;
 
 function normalizeUrl(url = window.location.href) {
   try {
@@ -42,6 +47,127 @@ function normalizeUrl(url = window.location.href) {
 
 function getCurrentPageKey() {
   return normalizeUrl(window.location.href);
+}
+
+const SCROLLABLE_OVERFLOW_RE = /(auto|scroll|overlay)/i;
+
+function isScrollableElement(element) {
+  if (!element || element === document.body || element === document.documentElement) return false;
+  const style = getComputedStyle(element);
+  const canScrollY = SCROLLABLE_OVERFLOW_RE.test(style.overflowY)
+    && element.scrollHeight > element.clientHeight + 1;
+  const canScrollX = SCROLLABLE_OVERFLOW_RE.test(style.overflowX)
+    && element.scrollWidth > element.clientWidth + 1;
+  return canScrollY || canScrollX;
+}
+
+function getNearestScrollParent(node) {
+  let current = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+  while (current && current !== document.body) {
+    if (isScrollableElement(current)) return current;
+    current = current.parentElement;
+  }
+  return window;
+}
+
+function scheduleReposition() {
+  if (repositionRaf) return;
+  repositionRaf = requestAnimationFrame(() => {
+    repositionRaf = 0;
+    if (!isExtensionEnabled || !notes.length) return;
+    repositionElements();
+  });
+}
+
+function stopAnchorRecovery() {
+  if (anchorRecoveryObserver) {
+    anchorRecoveryObserver.disconnect();
+    anchorRecoveryObserver = null;
+  }
+  if (anchorRecoveryInterval) {
+    clearInterval(anchorRecoveryInterval);
+    anchorRecoveryInterval = null;
+  }
+  if (anchorRecoveryStopTimeout) {
+    clearTimeout(anchorRecoveryStopTimeout);
+    anchorRecoveryStopTimeout = null;
+  }
+}
+
+function startAnchorRecovery(durationMs = 12000) {
+  stopAnchorRecovery();
+
+  const tick = () => {
+    if (!isExtensionEnabled || !notes.length) return;
+    repositionElements();
+  };
+
+  anchorRecoveryInterval = setInterval(tick, 500);
+  anchorRecoveryStopTimeout = setTimeout(stopAnchorRecovery, durationMs);
+
+  if (window.MutationObserver && document.body) {
+    anchorRecoveryObserver = new MutationObserver(() => {
+      scheduleReposition();
+    });
+    anchorRecoveryObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+  }
+}
+
+function watchScrollContainer(target) {
+  if (!target || target === window || watchedScrollContainers.has(target)) return;
+  watchedScrollContainers.add(target);
+  target.addEventListener('scroll', scheduleReposition, { passive: true });
+}
+
+function watchNoteScrollParent(noteId) {
+  if (!noteId) return;
+  const span = document.querySelector(`.ln-highlight-span[data-id="${noteId}"]`);
+  if (!span) return;
+  const scrollParent = getNearestScrollParent(span);
+  if (scrollParent !== window) watchScrollContainer(scrollParent);
+}
+
+function getHighlightSpanFromNode(node) {
+  const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+  if (!element?.closest) return null;
+  return element.closest('.ln-highlight-span[data-id]');
+}
+
+function ensureNoteCardById(id) {
+  if (!shadowRoot || !id) return null;
+  let card = shadowRoot.querySelector(`.ln-note-card[data-id="${id}"]`);
+  if (card) return card;
+  const note = notes.find((item) => item.id === id);
+  if (!note) return null;
+  renderNote(note, false);
+  card = shadowRoot.querySelector(`.ln-note-card[data-id="${id}"]`);
+  return card;
+}
+
+function openNoteCardById(id) {
+  const card = ensureNoteCardById(id);
+  if (!card) return;
+  hideAllCards();
+  card.classList.add('visible');
+}
+
+function getOverlapNoteIds(range) {
+  const ids = new Set();
+  const startSpan = getHighlightSpanFromNode(range.startContainer);
+  const endSpan = getHighlightSpanFromNode(range.endContainer);
+  if (startSpan?.dataset?.id) ids.add(startSpan.dataset.id);
+  if (endSpan?.dataset?.id) ids.add(endSpan.dataset.id);
+
+  const spans = getIntersectingHighlightSpans(range);
+  spans.forEach((span) => {
+    if (span.dataset.id) ids.add(span.dataset.id);
+  });
+
+  return [...ids];
 }
 
 function sanitizeLabelText(value) {
@@ -134,6 +260,10 @@ function init() {
   setTimeout(loadNotes, 500);
 
   window.addEventListener('resize', debounce(repositionElements, 100));
+  window.addEventListener('scroll', scheduleReposition, { passive: true });
+  window.addEventListener('wheel', scheduleReposition, { passive: true });
+  window.addEventListener('touchmove', scheduleReposition, { passive: true });
+  document.addEventListener('scroll', scheduleReposition, { passive: true, capture: true });
 
   document.addEventListener('mousedown', (e) => {
     if (!isExtensionEnabled) return;
@@ -349,21 +479,172 @@ function hideToolbar() {
 }
 
 // --- Note Creation & DOM Injection ---
-function applyHighlightToRange(range, id, color) {
-  const span = document.createElement('span');
+function applyHighlightVisual(span, color, visible = true, mode = 'base') {
+  if (!span || !COLORS[color]) return;
+  span.dataset.mode = mode;
+  span.style.cursor = visible ? 'pointer' : 'default';
+  span.style.pointerEvents = visible ? '' : 'none';
+
+  if (!visible) {
+    span.style.backgroundColor = 'transparent';
+    span.style.borderBottom = 'none';
+    span.style.boxShadow = 'none';
+    return;
+  }
+
+  if (mode === 'nested') {
+    span.style.backgroundColor = 'transparent';
+    span.style.borderBottom = `2px dashed ${COLORS[color].hex}`;
+    span.style.boxShadow = `inset 0 0 0 1px ${COLORS[color].hex}66`;
+    return;
+  }
+
   span.style.backgroundColor = COLORS[color].hl;
   span.style.borderBottom = `2px solid ${COLORS[color].hex}`;
-  span.style.cursor = 'pointer';
+  span.style.boxShadow = 'none';
+}
+
+function buildHighlightSpan(id, color, mode = 'base') {
+  const span = document.createElement('span');
   span.className = 'ln-highlight-span';
   span.dataset.id = id;
+  applyHighlightVisual(span, color, true, mode);
+  return span;
+}
 
-  try {
-    range.surroundContents(span);
-  } catch (error) {
-    const fragment = range.extractContents();
-    span.appendChild(fragment);
-    range.insertNode(span);
+function unwrapHighlightSpan(span) {
+  const parent = span.parentNode;
+  if (!parent) return;
+
+  while (span.firstChild) {
+    parent.insertBefore(span.firstChild, span);
   }
+  parent.removeChild(span);
+  parent.normalize();
+}
+
+function removeNoteUiById(id) {
+  const bubble = shadowRoot?.querySelector(`.ln-bubble[data-id="${id}"]`);
+  const card = shadowRoot?.querySelector(`.ln-note-card[data-id="${id}"]`);
+  if (bubble) bubble.remove();
+  if (card) card.remove();
+}
+
+function removeNotesByIds(ids, options = {}) {
+  const { removeHighlights = true, save = true } = options;
+  const idSet = new Set(ids.filter(Boolean));
+  if (!idSet.size) return;
+
+  notes = notes.filter((note) => !idSet.has(note.id));
+  idSet.forEach((id) => {
+    removeNoteUiById(id);
+    if (removeHighlights) removeHighlightById(id);
+  });
+
+  if (save) saveNotes();
+}
+
+function getIntersectingHighlightSpans(range) {
+  const spans = [];
+  document.querySelectorAll('.ln-highlight-span[data-id]').forEach((span) => {
+    try {
+      if (range.intersectsNode(span)) spans.push(span);
+    } catch (error) {
+      // Ignore invalid DOM states while page is re-rendering.
+    }
+  });
+  return spans;
+}
+
+function expandRangeToIncludeNode(range, node) {
+  const nodeRange = document.createRange();
+  nodeRange.selectNode(node);
+
+  if (nodeRange.compareBoundaryPoints(Range.START_TO_START, range) < 0) {
+    range.setStartBefore(node);
+  }
+  if (nodeRange.compareBoundaryPoints(Range.END_TO_END, range) > 0) {
+    range.setEndAfter(node);
+  }
+}
+
+function collectIntersectedTextSegments(range) {
+  const segments = [];
+  const root = range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+    ? range.commonAncestorContainer.parentNode
+    : range.commonAncestorContainer;
+  if (!root) return segments;
+
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || node.nodeValue.length === 0) return NodeFilter.FILTER_REJECT;
+      const parent = node.parentNode;
+      if (!parent) return NodeFilter.FILTER_REJECT;
+      if (['SCRIPT', 'STYLE', 'NOSCRIPT'].includes(parent.nodeName)) return NodeFilter.FILTER_REJECT;
+      if (shadowHost && shadowHost.contains(parent)) return NodeFilter.FILTER_REJECT;
+      try {
+        if (!range.intersectsNode(node)) return NodeFilter.FILTER_REJECT;
+      } catch (error) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+
+  const nodes = [];
+  let node;
+  while ((node = walker.nextNode())) nodes.push(node);
+
+  nodes.forEach((textNode) => {
+    let start = 0;
+    let end = textNode.nodeValue.length;
+
+    if (textNode === range.startContainer) start = range.startOffset;
+    if (textNode === range.endContainer) end = range.endOffset;
+    if (range.startContainer === range.endContainer && textNode === range.startContainer) {
+      start = range.startOffset;
+      end = range.endOffset;
+    }
+
+    if (start < end) segments.push({ node: textNode, start, end });
+  });
+
+  return segments;
+}
+
+function applyHighlightToRange(range, id, color, options = {}) {
+  const { mergeOverlaps = false } = options;
+  const workingRange = range.cloneRange();
+
+  if (mergeOverlaps) {
+    const overlapSpans = getIntersectingHighlightSpans(workingRange);
+    if (overlapSpans.length) {
+      overlapSpans.forEach((span) => {
+        expandRangeToIncludeNode(workingRange, span);
+      });
+
+      const overlapIds = [...new Set(overlapSpans.map((span) => span.dataset.id).filter(Boolean))];
+      overlapSpans.forEach((span) => unwrapHighlightSpan(span));
+      removeNotesByIds(overlapIds, { removeHighlights: false, save: false });
+    }
+  }
+
+  const segments = collectIntersectedTextSegments(workingRange);
+  if (!segments.length) return false;
+
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    const { node, start, end } = segments[i];
+    const partRange = document.createRange();
+    partRange.setStart(node, start);
+    partRange.setEnd(node, end);
+    const isNested = !!node.parentNode?.closest?.('.ln-highlight-span[data-id]');
+    const span = buildHighlightSpan(id, color, isNested ? 'nested' : 'base');
+    const fragment = partRange.extractContents();
+    span.appendChild(fragment);
+    partRange.insertNode(span);
+  }
+
+  return true;
 }
 
 function getRangeAnchorRect(range) {
@@ -375,9 +656,102 @@ function getRangeAnchorRect(range) {
   return range.getBoundingClientRect();
 }
 
+function getRangeTailRect(range) {
+  const rects = range.getClientRects();
+  for (let i = rects.length - 1; i >= 0; i -= 1) {
+    const rect = rects[i];
+    if (rect.width > 0 || rect.height > 0) return rect;
+  }
+  return range.getBoundingClientRect();
+}
+
+function isIgnoredTextParent(parent) {
+  if (!parent) return true;
+  if (['SCRIPT', 'STYLE', 'NOSCRIPT'].includes(parent.nodeName)) return true;
+  if (shadowHost && shadowHost.contains(parent)) return true;
+  return false;
+}
+
+function findNodeIndexByGlobalOffset(starts, offset) {
+  let lo = 0;
+  let hi = starts.length - 1;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (starts[mid] <= offset) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return Math.max(0, hi);
+}
+
+function findBestRangeByTextAcrossNodes(targetText, targetTop, targetLeft) {
+  if (!targetText) return null;
+
+  const nodes = [];
+  const starts = [];
+  let fullText = '';
+
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+  let node;
+  while ((node = walker.nextNode())) {
+    const text = node.nodeValue;
+    if (!text) continue;
+    if (isIgnoredTextParent(node.parentNode)) continue;
+    starts.push(fullText.length);
+    nodes.push(node);
+    fullText += text;
+  }
+
+  if (!fullText || !nodes.length) return null;
+
+  let bestRange = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  let fromIndex = 0;
+
+  while (fromIndex < fullText.length) {
+    const index = fullText.indexOf(targetText, fromIndex);
+    if (index === -1) break;
+
+    const endIndexExclusive = index + targetText.length;
+    const startNodeIndex = findNodeIndexByGlobalOffset(starts, index);
+    const endNodeIndex = findNodeIndexByGlobalOffset(starts, Math.max(index, endIndexExclusive - 1));
+    const startNode = nodes[startNodeIndex];
+    const endNode = nodes[endNodeIndex];
+
+    const startOffset = index - starts[startNodeIndex];
+    const endOffset = endIndexExclusive - starts[endNodeIndex];
+
+    if (
+      startNode
+      && endNode
+      && startOffset >= 0
+      && endOffset >= 0
+      && startOffset <= startNode.nodeValue.length
+      && endOffset <= endNode.nodeValue.length
+    ) {
+      const candidate = document.createRange();
+      candidate.setStart(startNode, startOffset);
+      candidate.setEnd(endNode, endOffset);
+
+      const rect = getRangeTailRect(candidate);
+      const top = rect.top + window.scrollY;
+      const left = rect.right + window.scrollX;
+      const distance = Math.hypot(top - targetTop, left - targetLeft);
+
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestRange = candidate;
+      }
+    }
+
+    fromIndex = index + 1;
+  }
+
+  return bestRange;
+}
+
 function getHighlightAnchorRectById(id) {
   const spans = document.querySelectorAll(`.ln-highlight-span[data-id="${id}"]`);
-  for (let i = 0; i < spans.length; i += 1) {
+  for (let i = spans.length - 1; i >= 0; i -= 1) {
     const rect = spans[i].getBoundingClientRect();
     if (rect.width > 0 || rect.height > 0) return rect;
   }
@@ -390,7 +764,7 @@ function updateNoteAnchorFromHighlight(note) {
   if (!rect) return false;
 
   note.anchor.scrollTop = rect.top + window.scrollY;
-  note.anchor.scrollLeft = rect.left + (rect.width / 2) + window.scrollX;
+  note.anchor.scrollLeft = rect.right + window.scrollX;
   return true;
 }
 
@@ -405,21 +779,43 @@ function positionNoteUI(note) {
   card.style.left = `${note.anchor.scrollLeft}px`;
 }
 
+function setNoteAnchoredState(noteId, anchored) {
+  if (!shadowRoot) return;
+  const bubble = shadowRoot.querySelector(`.ln-bubble[data-id="${noteId}"]`);
+  const card = shadowRoot.querySelector(`.ln-note-card[data-id="${noteId}"]`);
+  if (!bubble || !card) return;
+
+  if (anchored) {
+    bubble.style.visibility = '';
+    bubble.style.pointerEvents = '';
+    return;
+  }
+
+  bubble.style.visibility = 'hidden';
+  bubble.style.pointerEvents = 'none';
+  card.classList.remove('visible');
+}
+
 function createNote(color) {
   if (!isExtensionEnabled) return;
   if (!activeSelection) return;
 
-  const range = activeSelection;
+  const range = activeSelection.cloneRange();
   const text = range.toString().trim();
+  if (!text) return;
   const id = Date.now().toString(36) + Math.random().toString(36).substr(2);
 
-  const rect = getRangeAnchorRect(range);
-  if (rect.width === 0 && rect.height === 0) return;
+  const scrollParent = getNearestScrollParent(range.startContainer);
+  if (scrollParent !== window) watchScrollContainer(scrollParent);
 
-  const scrollTop = rect.top + window.scrollY;
-  const scrollLeft = rect.left + (rect.width / 2) + window.scrollX;
+  const tailRect = getRangeTailRect(range);
+  if (tailRect.width === 0 && tailRect.height === 0) return;
 
-  applyHighlightToRange(range, id, color);
+  const applied = applyHighlightToRange(range, id, color, { mergeOverlaps: false });
+  if (!applied) return;
+
+  const scrollTop = tailRect.top + window.scrollY;
+  const scrollLeft = tailRect.right + window.scrollX;
 
   const anchor = {
     text,
@@ -432,6 +828,7 @@ function createNote(color) {
 
   // Prefer exact highlight geometry over raw selection bounds.
   updateNoteAnchorFromHighlight(note);
+  watchNoteScrollParent(note.id);
 
   notes.push(note);
   saveNotes();
@@ -446,7 +843,7 @@ function renderNote(note, autoShow = false) {
   const noteUrl = note?.anchor?.url;
   if (noteUrl && normalizeUrl(noteUrl) !== getCurrentPageKey()) return;
 
-  updateNoteAnchorFromHighlight(note);
+  const anchored = updateNoteAnchorFromHighlight(note);
 
   const bubble = document.createElement('div');
   bubble.className = `ln-bubble ln-c-${note.color}`;
@@ -517,6 +914,7 @@ function renderNote(note, autoShow = false) {
 
   shadowRoot.appendChild(bubble);
   shadowRoot.appendChild(card);
+  watchNoteScrollParent(note.id);
 
   if (autoShow) {
     setTimeout(() => {
@@ -526,6 +924,7 @@ function renderNote(note, autoShow = false) {
   }
 
   positionNoteUI(note);
+  setNoteAnchoredState(note.id, anchored);
 }
 
 function toggleCard(card) {
@@ -562,17 +961,8 @@ function removeHighlightById(id) {
 function setHighlightVisibleById(id, color, visible) {
   const spans = document.querySelectorAll(`.ln-highlight-span[data-id="${id}"]`);
   spans.forEach((span) => {
-    if (visible) {
-      span.style.backgroundColor = COLORS[color].hl;
-      span.style.borderBottom = `2px solid ${COLORS[color].hex}`;
-      span.style.cursor = 'pointer';
-      span.style.pointerEvents = '';
-    } else {
-      span.style.backgroundColor = 'transparent';
-      span.style.borderBottom = 'none';
-      span.style.cursor = 'default';
-      span.style.pointerEvents = 'none';
-    }
+    const mode = span.dataset.mode || 'base';
+    applyHighlightVisual(span, color, visible, mode);
   });
 }
 
@@ -632,6 +1022,7 @@ function loadNotes() {
 
     if (!notes.length) {
       console.log('LingoNote Debug: no notes for current page');
+      stopAnchorRecovery();
       return;
     }
 
@@ -650,6 +1041,8 @@ function loadNotes() {
       repositionElements();
       saveNotes();
     }, 1200);
+
+    startAnchorRecovery();
   });
 }
 
@@ -659,6 +1052,7 @@ function reconstructHighlight(note) {
 
   if (document.querySelector(`.ln-highlight-span[data-id="${note.id}"]`)) {
     updateNoteAnchorFromHighlight(note);
+    watchNoteScrollParent(note.id);
     return;
   }
 
@@ -672,8 +1066,7 @@ function reconstructHighlight(note) {
   while ((node = walker.nextNode())) {
     const textContent = node.nodeValue;
     if (!textContent) continue;
-    if (['SCRIPT', 'STYLE'].includes(node.parentNode.nodeName)) continue;
-    if (node.parentNode.className === 'ln-highlight-span') continue;
+    if (isIgnoredTextParent(node.parentNode)) continue;
 
     let fromIndex = 0;
     while (fromIndex < textContent.length) {
@@ -683,9 +1076,9 @@ function reconstructHighlight(note) {
       const range = document.createRange();
       range.setStart(node, index);
       range.setEnd(node, index + targetText.length);
-      const rect = getRangeAnchorRect(range);
-      const top = rect.top + window.scrollY;
-      const left = rect.left + (rect.width / 2) + window.scrollX;
+      const tailRect = getRangeTailRect(range);
+      const top = tailRect.top + window.scrollY;
+      const left = tailRect.right + window.scrollX;
       const distance = Math.hypot(top - targetTop, left - targetLeft);
 
       if (distance < bestDistance) {
@@ -697,11 +1090,18 @@ function reconstructHighlight(note) {
     }
   }
 
+  if (!bestMatch) {
+    bestMatch = findBestRangeByTextAcrossNodes(targetText, targetTop, targetLeft);
+  }
+
   if (bestMatch) {
-    applyHighlightToRange(bestMatch, note.id, note.color);
-    updateNoteAnchorFromHighlight(note);
-    if (!isExtensionEnabled) {
-      setHighlightVisibleById(note.id, note.color, false);
+    const applied = applyHighlightToRange(bestMatch, note.id, note.color, { mergeOverlaps: false });
+    if (applied) {
+      updateNoteAnchorFromHighlight(note);
+      watchNoteScrollParent(note.id);
+      if (!isExtensionEnabled) {
+        setHighlightVisibleById(note.id, note.color, false);
+      }
     }
   }
 }
@@ -710,6 +1110,7 @@ function repositionElements() {
   notes.forEach((note) => {
     const updated = updateNoteAnchorFromHighlight(note);
     if (updated) positionNoteUI(note);
+    setNoteAnchoredState(note.id, updated);
   });
 }
 
@@ -756,8 +1157,11 @@ function setExtensionEnabled(enabled) {
   setHighlightsVisible(enabled);
 
   if (!enabled) {
+    stopAnchorRecovery();
     hideToolbar();
     hideAllCards();
+  } else if (notes.length) {
+    startAnchorRecovery(6000);
   }
 }
 

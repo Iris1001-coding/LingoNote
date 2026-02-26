@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Download, Highlighter, BookOpen, Trash2, Info, Check, X, Settings, GripVertical, Minimize2 } from 'lucide-react';
 
-const RELEASE_ZIP_URL = 'https://github.com/Iris1001-coding/LingoNote/releases/download/v1.0.1/LingoNote_v1.0.1.zip';
+const RELEASE_ZIP_URL = 'https://github.com/Iris1001-coding/LingoNote/releases/download/v1.0.2/LingoNote_v1.0.2.zip';
 
 const downloadExtension = () => {
   window.open(RELEASE_ZIP_URL, '_blank', 'noopener,noreferrer');
