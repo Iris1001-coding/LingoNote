@@ -94,11 +94,32 @@ function stopAnchorRecovery() {
   }
 }
 
+function hasHighlightForNoteId(noteId) {
+  if (!noteId) return false;
+  return !!document.querySelector(`.ln-highlight-span[data-id="${noteId}"]`);
+}
+
+function getMissingHighlightNotes() {
+  return notes.filter((note) => note?.id && !hasHighlightForNoteId(note.id));
+}
+
+function recoverMissingHighlights() {
+  const missing = getMissingHighlightNotes();
+  if (!missing.length) return 0;
+
+  missing.forEach((note) => {
+    reconstructHighlight(note);
+  });
+
+  return getMissingHighlightNotes().length;
+}
+
 function startAnchorRecovery(durationMs = 12000) {
   stopAnchorRecovery();
 
   const tick = () => {
     if (!isExtensionEnabled || !notes.length) return;
+    recoverMissingHighlights();
     repositionElements();
   };
 
@@ -683,6 +704,40 @@ function findNodeIndexByGlobalOffset(starts, offset) {
   return Math.max(0, hi);
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function collectTextMatchCandidates(fullText, targetText) {
+  const candidates = [];
+  if (!targetText) return candidates;
+
+  // Exact matches first.
+  let fromIndex = 0;
+  while (fromIndex < fullText.length) {
+    const index = fullText.indexOf(targetText, fromIndex);
+    if (index === -1) break;
+    candidates.push({ start: index, end: index + targetText.length });
+    fromIndex = index + 1;
+  }
+
+  if (candidates.length) return candidates;
+
+  // Fallback: ignore whitespace shape differences (spaces/newlines/tabs).
+  const tokens = targetText.trim().split(/\s+/).filter(Boolean).map(escapeRegExp);
+  if (!tokens.length) return candidates;
+  const regex = new RegExp(tokens.join('\\s+'), 'g');
+  let match;
+  while ((match = regex.exec(fullText))) {
+    const start = match.index;
+    const end = start + match[0].length;
+    candidates.push({ start, end });
+    if (match[0].length === 0) regex.lastIndex += 1;
+  }
+
+  return candidates;
+}
+
 function findBestRangeByTextAcrossNodes(targetText, targetTop, targetLeft) {
   if (!targetText) return null;
 
@@ -705,19 +760,16 @@ function findBestRangeByTextAcrossNodes(targetText, targetTop, targetLeft) {
 
   let bestRange = null;
   let bestDistance = Number.POSITIVE_INFINITY;
-  let fromIndex = 0;
+  const candidates = collectTextMatchCandidates(fullText, targetText);
 
-  while (fromIndex < fullText.length) {
-    const index = fullText.indexOf(targetText, fromIndex);
-    if (index === -1) break;
-
-    const endIndexExclusive = index + targetText.length;
-    const startNodeIndex = findNodeIndexByGlobalOffset(starts, index);
-    const endNodeIndex = findNodeIndexByGlobalOffset(starts, Math.max(index, endIndexExclusive - 1));
+  candidates.forEach(({ start, end }) => {
+    const endIndexExclusive = end;
+    const startNodeIndex = findNodeIndexByGlobalOffset(starts, start);
+    const endNodeIndex = findNodeIndexByGlobalOffset(starts, Math.max(start, endIndexExclusive - 1));
     const startNode = nodes[startNodeIndex];
     const endNode = nodes[endNodeIndex];
 
-    const startOffset = index - starts[startNodeIndex];
+    const startOffset = start - starts[startNodeIndex];
     const endOffset = endIndexExclusive - starts[endNodeIndex];
 
     if (
@@ -742,9 +794,7 @@ function findBestRangeByTextAcrossNodes(targetText, targetTop, targetLeft) {
         bestRange = candidate;
       }
     }
-
-    fromIndex = index + 1;
-  }
+  });
 
   return bestRange;
 }
@@ -1038,11 +1088,12 @@ function loadNotes() {
 
     // Reposition once after delayed page layout settles.
     setTimeout(() => {
+      recoverMissingHighlights();
       repositionElements();
       saveNotes();
     }, 1200);
 
-    startAnchorRecovery();
+    startAnchorRecovery(20000);
   });
 }
 
