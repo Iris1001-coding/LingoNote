@@ -107,8 +107,9 @@ function recoverMissingHighlights() {
   const missing = getMissingHighlightNotes();
   if (!missing.length) return 0;
 
+  const textModel = buildPageTextModel();
   missing.forEach((note) => {
-    reconstructHighlight(note);
+    reconstructHighlight(note, textModel);
   });
 
   return getMissingHighlightNotes().length;
@@ -708,6 +709,11 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function normalizeContextText(value) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\s+/g, ' ').trim();
+}
+
 function collectTextMatchCandidates(fullText, targetText) {
   const candidates = [];
   if (!targetText) return candidates;
@@ -738,9 +744,7 @@ function collectTextMatchCandidates(fullText, targetText) {
   return candidates;
 }
 
-function findBestRangeByTextAcrossNodes(targetText, targetTop, targetLeft) {
-  if (!targetText) return null;
-
+function buildPageTextModel() {
   const nodes = [];
   const starts = [];
   let fullText = '';
@@ -756,43 +760,109 @@ function findBestRangeByTextAcrossNodes(targetText, targetTop, targetLeft) {
     fullText += text;
   }
 
-  if (!fullText || !nodes.length) return null;
+  return { nodes, starts, fullText };
+}
+
+function getRangeFromModelOffsets(model, start, end) {
+  if (!model || !model.nodes.length || start >= end) return null;
+  const startNodeIndex = findNodeIndexByGlobalOffset(model.starts, start);
+  const endNodeIndex = findNodeIndexByGlobalOffset(model.starts, Math.max(start, end - 1));
+  const startNode = model.nodes[startNodeIndex];
+  const endNode = model.nodes[endNodeIndex];
+
+  if (!startNode || !endNode) return null;
+
+  const startOffset = start - model.starts[startNodeIndex];
+  const endOffset = end - model.starts[endNodeIndex];
+
+  if (
+    startOffset < 0
+    || endOffset < 0
+    || startOffset > startNode.nodeValue.length
+    || endOffset > endNode.nodeValue.length
+  ) {
+    return null;
+  }
+
+  const range = document.createRange();
+  range.setStart(startNode, startOffset);
+  range.setEnd(endNode, endOffset);
+  return range;
+}
+
+function getRangeContext(range, size = 30) {
+  const context = { before: '', after: '' };
+  try {
+    const beforeRange = document.createRange();
+    beforeRange.selectNodeContents(document.body);
+    beforeRange.setEnd(range.startContainer, range.startOffset);
+    context.before = normalizeContextText(beforeRange.toString().slice(-size));
+
+    const afterRange = document.createRange();
+    afterRange.selectNodeContents(document.body);
+    afterRange.setStart(range.endContainer, range.endOffset);
+    context.after = normalizeContextText(afterRange.toString().slice(0, size));
+  } catch (error) {
+    // Ignore context extraction failures on unstable DOMs.
+  }
+  return context;
+}
+
+function scoreContext(storedValue, candidateValue, isAfter) {
+  if (!storedValue || !candidateValue) return 0;
+  if (storedValue === candidateValue) return 1;
+  if (isAfter) {
+    if (candidateValue.startsWith(storedValue) || storedValue.startsWith(candidateValue)) return 0.8;
+  } else if (candidateValue.endsWith(storedValue) || storedValue.endsWith(candidateValue)) {
+    return 0.8;
+  }
+  if (candidateValue.includes(storedValue) || storedValue.includes(candidateValue)) return 0.5;
+  return 0;
+}
+
+function scoreCandidateForNote(note, model, start, end, range) {
+  const tailRect = getRangeTailRect(range);
+  const top = tailRect.top + window.scrollY;
+  const left = tailRect.right + window.scrollX;
+  const targetTop = Number(note?.anchor?.scrollTop) || 0;
+  const targetLeft = Number(note?.anchor?.scrollLeft) || 0;
+  const distance = Math.hypot(top - targetTop, left - targetLeft);
+
+  const beforeStored = normalizeContextText(note?.anchor?.contextBefore || '');
+  const afterStored = normalizeContextText(note?.anchor?.contextAfter || '');
+
+  let contextScore = 0;
+  if (beforeStored || afterStored) {
+    const beforeCandidate = normalizeContextText(model.fullText.slice(Math.max(0, start - 30), start));
+    const afterCandidate = normalizeContextText(model.fullText.slice(end, Math.min(model.fullText.length, end + 30)));
+    contextScore += scoreContext(beforeStored, beforeCandidate, false);
+    contextScore += scoreContext(afterStored, afterCandidate, true);
+  }
+
+  // Context has higher priority than raw distance when duplicate text exists.
+  return (contextScore * 10000) - distance;
+}
+
+function findBestRangeForNote(note, providedModel = null) {
+  const targetText = note?.anchor?.text;
+  if (!targetText) return null;
+
+  const model = providedModel || buildPageTextModel();
+  if (!model.fullText || !model.nodes.length) return null;
+
+  const candidates = collectTextMatchCandidates(model.fullText, targetText);
+  if (!candidates.length) return null;
 
   let bestRange = null;
-  let bestDistance = Number.POSITIVE_INFINITY;
-  const candidates = collectTextMatchCandidates(fullText, targetText);
+  let bestScore = Number.NEGATIVE_INFINITY;
 
   candidates.forEach(({ start, end }) => {
-    const endIndexExclusive = end;
-    const startNodeIndex = findNodeIndexByGlobalOffset(starts, start);
-    const endNodeIndex = findNodeIndexByGlobalOffset(starts, Math.max(start, endIndexExclusive - 1));
-    const startNode = nodes[startNodeIndex];
-    const endNode = nodes[endNodeIndex];
-
-    const startOffset = start - starts[startNodeIndex];
-    const endOffset = endIndexExclusive - starts[endNodeIndex];
-
-    if (
-      startNode
-      && endNode
-      && startOffset >= 0
-      && endOffset >= 0
-      && startOffset <= startNode.nodeValue.length
-      && endOffset <= endNode.nodeValue.length
-    ) {
-      const candidate = document.createRange();
-      candidate.setStart(startNode, startOffset);
-      candidate.setEnd(endNode, endOffset);
-
-      const rect = getRangeTailRect(candidate);
-      const top = rect.top + window.scrollY;
-      const left = rect.right + window.scrollX;
-      const distance = Math.hypot(top - targetTop, left - targetLeft);
-
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestRange = candidate;
-      }
+    const candidateRange = getRangeFromModelOffsets(model, start, end);
+    if (!candidateRange) return;
+    const score = scoreCandidateForNote(note, model, start, end, candidateRange);
+    if (score > bestScore) {
+      bestScore = score;
+      bestRange = candidateRange;
     }
   });
 
@@ -866,12 +936,15 @@ function createNote(color) {
 
   const scrollTop = tailRect.top + window.scrollY;
   const scrollLeft = tailRect.right + window.scrollX;
+  const context = getRangeContext(range);
 
   const anchor = {
     text,
     scrollTop,
     scrollLeft,
     url: getCurrentPageKey(),
+    contextBefore: context.before,
+    contextAfter: context.after,
   };
 
   const note = { id, color, text: '', anchor, createdAt: Date.now() };
@@ -1076,8 +1149,9 @@ function loadNotes() {
       return;
     }
 
+    const textModel = buildPageTextModel();
     notes.forEach((note) => {
-      reconstructHighlight(note);
+      reconstructHighlight(note, textModel);
       updateNoteAnchorFromHighlight(note);
       renderNote(note, false);
     });
@@ -1097,7 +1171,7 @@ function loadNotes() {
   });
 }
 
-function reconstructHighlight(note) {
+function reconstructHighlight(note, providedModel = null) {
   const targetText = note?.anchor?.text;
   if (!targetText) return;
 
@@ -1107,48 +1181,17 @@ function reconstructHighlight(note) {
     return;
   }
 
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-  let node;
-  let bestMatch = null;
-  let bestDistance = Number.POSITIVE_INFINITY;
-  const targetTop = Number(note?.anchor?.scrollTop) || 0;
-  const targetLeft = Number(note?.anchor?.scrollLeft) || 0;
-
-  while ((node = walker.nextNode())) {
-    const textContent = node.nodeValue;
-    if (!textContent) continue;
-    if (isIgnoredTextParent(node.parentNode)) continue;
-
-    let fromIndex = 0;
-    while (fromIndex < textContent.length) {
-      const index = textContent.indexOf(targetText, fromIndex);
-      if (index === -1) break;
-
-      const range = document.createRange();
-      range.setStart(node, index);
-      range.setEnd(node, index + targetText.length);
-      const tailRect = getRangeTailRect(range);
-      const top = tailRect.top + window.scrollY;
-      const left = tailRect.right + window.scrollX;
-      const distance = Math.hypot(top - targetTop, left - targetLeft);
-
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestMatch = range;
-      }
-
-      fromIndex = index + targetText.length;
-    }
-  }
-
-  if (!bestMatch) {
-    bestMatch = findBestRangeByTextAcrossNodes(targetText, targetTop, targetLeft);
-  }
+  const bestMatch = findBestRangeForNote(note, providedModel);
 
   if (bestMatch) {
     const applied = applyHighlightToRange(bestMatch, note.id, note.color, { mergeOverlaps: false });
     if (applied) {
       updateNoteAnchorFromHighlight(note);
+      if (!note.anchor.contextBefore && !note.anchor.contextAfter) {
+        const context = getRangeContext(bestMatch);
+        note.anchor.contextBefore = context.before;
+        note.anchor.contextAfter = context.after;
+      }
       watchNoteScrollParent(note.id);
       if (!isExtensionEnabled) {
         setHighlightVisibleById(note.id, note.color, false);

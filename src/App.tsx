@@ -1,8 +1,8 @@
-import { useState, useEffect, useRef } from 'react';
+﻿import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Download, Highlighter, BookOpen, Trash2, Info, Check, X, Settings, GripVertical, Minimize2 } from 'lucide-react';
 
-const RELEASE_ZIP_URL = 'https://github.com/Iris1001-coding/LingoNote/releases/download/v1.0.2/LingoNote_v1.0.2.zip';
+const RELEASE_ZIP_URL = 'https://github.com/Iris1001-coding/LingoNote/releases/download/v1.0.3/LingoNote_v1.0.3.zip';
 
 const downloadExtension = () => {
   window.open(RELEASE_ZIP_URL, '_blank', 'noopener,noreferrer');
@@ -589,8 +589,9 @@ export default function App() {
       </main>
 
       <footer className="bg-neutral-900 text-neutral-400 py-12 text-center">
-        <p>© 2024 LingoNote. Open Source & Privacy Focused.</p>
+        <p>漏 2024 LingoNote. Open Source & Privacy Focused.</p>
       </footer>
     </div>
   );
 }
+
